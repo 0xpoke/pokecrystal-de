@@ -51,7 +51,7 @@ def decode_rom_text(rom_bytes, address, charmap, max_length=256):
     
     Args:
         rom_bytes: ROM data as bytes
-        address: Address to start reading from
+        address: Address to start reading from (absolute ROM address)
         charmap: byte -> character mapping
         max_length: Maximum string length to prevent runaway reads
     
@@ -83,37 +83,71 @@ def decode_rom_text(rom_bytes, address, charmap, max_length=256):
     return ''.join(text), pos + 1  # +1 for the terminator
 
 
+def bank_address_to_rom_offset(bank, address):
+    """
+    Convert Game Boy bank:address to absolute ROM offset.
+    
+    Bank 0: $0000-$3FFF (addresses 0x0000-0x3FFF)
+    Banks 1+: each is 0x4000 bytes starting at ROM offset 0x4000
+    
+    Args:
+        bank: Bank number (0-127)
+        address: Address within bank ($0000-$3FFF)
+    
+    Returns:
+        int: Absolute ROM offset
+    """
+    if bank == 0:
+        return address
+    else:
+        return 0x4000 + (bank - 1) * 0x4000 + address
+
+
 def parse_map_file(map_file):
     """
     Parse pokecrystal.map to find text symbol addresses.
     
-    The map file format is:
-    ADDRESS SYMBOLNAME
+    Format:
+    ROM0 bank #0:
+        SECTION: $0000-$0003 ($0004 bytes) ["sectionname"]
+                 $0000 = SymbolName
+    
+    ROMX bank #1:
+        SECTION: $4000-$5FFF ($2000 bytes) ["sectionname"]
+                 $4000 = TextSymbol
     
     Returns:
-        dict: Maps symbol name to address (int)
+        dict: Maps symbol name to ROM offset (int)
     """
     symbols = {}
+    current_bank = 0
+    current_section_start = 0
     
     with open(map_file, 'r', encoding='utf-8') as f:
         for line in f:
-            line = line.strip()
+            line = line.rstrip()
             
-            # Skip empty lines and comments
-            if not line or line.startswith(';'):
+            # Skip empty lines
+            if not line.strip():
                 continue
             
-            # Try to parse: ADDRESS SYMBOLNAME
-            parts = line.split()
-            if len(parts) >= 2:
-                try:
-                    addr = int(parts[0], 16)
-                    name = parts[1]
-                    # Only store text-related symbols
-                    if 'Text' in name or 'text' in name:
-                        symbols[name] = addr
-                except ValueError:
-                    pass
+            # Parse bank header: "ROM0 bank #0:" or "ROMX bank #1:"
+            bank_match = re.match(r'^(ROM0|ROMX)\s+bank\s+#(\d+):', line)
+            if bank_match:
+                current_bank = int(bank_match.group(2))
+                continue
+            
+            # Parse symbol: "         $XXXX = SymbolName"
+            symbol_match = re.match(r'\s+\$([0-9a-fA-F]+)\s*=\s*(\S+)', line)
+            if symbol_match:
+                address = int(symbol_match.group(1), 16)
+                symbol_name = symbol_match.group(2)
+                
+                # Only store text-related symbols
+                if 'Text' in symbol_name or 'text' in symbol_name:
+                    # Convert bank:address to ROM offset
+                    rom_offset = bank_address_to_rom_offset(current_bank, address)
+                    symbols[symbol_name] = rom_offset
     
     return symbols
 
@@ -159,6 +193,11 @@ def main():
     symbols = parse_map_file(map_file)
     print(f"      Found {len(symbols)} text symbols")
     
+    if len(symbols) == 0:
+        print("\n⚠ Warning: No text symbols found in map file!")
+        print("Check that pokecrystal.map exists and has the correct format.")
+        sys.exit(1)
+    
     print("[3/4] Loading ROM...")
     with open(rom_path, 'rb') as f:
         rom_bytes = f.read()
@@ -170,19 +209,14 @@ def main():
     extracted_count = 0
     
     for symbol_name in sorted(symbols.keys()):
-        address = symbols[symbol_name]
-        
-        # Convert address to ROM offset
-        # Game Boy ROM bank layout: Bank 0 = 0x0000-0x3FFF, Bank N = 0x4000 + (N-1)*0x4000
-        # But the map file uses absolute addresses, we need to convert
-        rom_address = address
+        rom_offset = symbols[symbol_name]
         
         # Extract text
-        text, length = decode_rom_text(rom_bytes, rom_address, charmap)
+        text, length = decode_rom_text(rom_bytes, rom_offset, charmap)
         
-        if text:
+        if text and len(text) > 0:
             extracted_text[symbol_name] = {
-                'address': f'0x{address:06x}',
+                'offset': f'0x{rom_offset:06x}',
                 'length': length,
                 'text': text
             }
@@ -198,20 +232,17 @@ def main():
         for symbol_name in sorted(extracted_text.keys()):
             data = extracted_text[symbol_name]
             f.write(f"## {symbol_name}\n")
-            f.write(f"Address: {data['address']}\n")
-            f.write(f"Length:  {data['length']} bytes\n")
-            f.write(f"Text:    {data['text']}\n")
+            f.write(f"ROM Offset: {data['offset']}\n")
+            f.write(f"Length:     {data['length']} bytes\n")
+            f.write(f"Text:       {data['text']}\n")
             f.write("\n")
     
-    print(f"✓ Extracted {extracted_count} text strings")
+    print(f"✓ Extracted {extracted_count}/{len(symbols)} text strings")
     print(f"✓ Output written to: {output_path}")
     
-    if extracted_count == 0:
-        print("\n⚠ Warning: No text strings extracted!")
-        print("This could mean:")
-        print("  1. The ROM addresses don't match the .map file")
-        print("  2. Text is stored differently in the German ROM")
-        print("  3. The charmap needs adjustment for German characters")
+    if extracted_count < len(symbols):
+        print(f"\n⚠ Note: Only extracted {extracted_count} out of {len(symbols)} symbols")
+        print("Some text strings may be empty or corrupted in the ROM.")
 
 
 if __name__ == '__main__':
